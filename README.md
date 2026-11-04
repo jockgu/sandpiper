@@ -1,4 +1,4 @@
-# Sendspin Satellite (Android)
+# Sandpiper for Android
 
 Alpha Android Sendspin client focused on reliability-first playback.
 
@@ -29,15 +29,17 @@ Known alpha limitations:
 
 ## Sendspin compatibility
 
-Sendspin Satellite uses `sendspin-cpp` v0.9.5 and requires encrypted Sendspin
+Sandpiper uses `sendspin-cpp` v0.9.5 and requires encrypted Sendspin
 connections (core protocol v1 and `player@v1`). The minimum validated Music
 Assistant version is **2.10.7**. Earlier versions are unverified, and releases
 that only support legacy cleartext Sendspin connections cannot connect. The app
 has no cleartext fallback.
 
-The first encrypted release changes the satellite's client identity from the
-previous Android ID-based value. Music Assistant may show a new player entry;
-remove the old entry and pair the new one if needed.
+The first encrypted release changed the client's identity from the earlier
+Android ID-based value. Music Assistant may show a new player entry; remove the
+old entry and pair the new one if needed. Sandpiper keeps its existing Android
+package and signing identity, so installed copies can update in place with
+their saved settings and pairing credentials.
 
 Compatible additive protocol extensions are tolerated where the Sendspin
 specification defines them. A future core or role protocol version is supported

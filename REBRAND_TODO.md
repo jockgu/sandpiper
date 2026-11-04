@@ -1,7 +1,7 @@
 # Sandpiper rebrand TODO
 
-Move the app from **Sendspin Satellite** to **Sandpiper**, with a simple bird
-identity and the same focus on reliable playback.
+Establish **Sandpiper** as the app's public identity, with a simple bird mark
+and the same focus on reliable playback.
 
 Working description: **A Sendspin player for Android.**
 
@@ -58,7 +58,7 @@ Working description: **A Sendspin player for Android.**
 - [x] Update the report heading in `AudioDiagnostics.kt` and any related test
   expectations so exported diagnostics identify Sandpiper.
 - [x] Set `rootProject.name` in `settings.gradle.kts` to `Sandpiper`.
-- [ ] Review remaining old-name matches individually. References to the actual
+- [x] Review remaining old-name matches individually. References to the actual
   Sendspin protocol and internal technical identifiers are expected to remain.
 
 ## 3. Introduce the bird identity
@@ -80,12 +80,12 @@ Working description: **A Sendspin player for Android.**
 
 ## 4. Update documentation and release materials
 
-- [ ] Update the README title and product references, retaining the protocol
+- [x] Update the README title and product references, retaining the protocol
   compatibility requirements and the existing encrypted-release migration notes.
-- [ ] Update the current product heading in `TODO.md`. Preserve completed work
+- [x] Update the current product heading in `TODO.md`. Preserve completed work
   and historical technical names where they explain earlier implementation.
-- [ ] Explain that Sandpiper is the renamed Sendspin Satellite and that existing
-  installations should update in place with their settings and pairing intact.
+- [x] Document that existing installations can update in place with their
+  settings and pairing intact.
 - [ ] Agree the public repository name and description. If the repository is
   renamed, update affected links, clone instructions, and release references.
 - [ ] Use consistent Sandpiper wording and artwork for APK download descriptions,

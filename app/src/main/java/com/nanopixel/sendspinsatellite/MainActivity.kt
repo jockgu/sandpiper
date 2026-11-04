@@ -11,8 +11,11 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.LaunchedEffect
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.nanopixel.sendspinsatellite.connection.ConnectionViewModel
+import com.nanopixel.sendspinsatellite.playback.PlaybackCommand
+import com.nanopixel.sendspinsatellite.ui.SandpiperTheme
 import com.nanopixel.sendspinsatellite.ui.SendspinSatelliteApp
 
 class MainActivity : ComponentActivity() {
@@ -27,6 +30,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        installSplashScreen()
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
@@ -34,16 +38,21 @@ class MainActivity : ComponentActivity() {
             LaunchedEffect(Unit) {
                 withLocalNetworkPermission(connectionViewModel::start)
             }
-            SendspinSatelliteApp(
-                state = state,
-                onServerAddressChanged = connectionViewModel::updateServerAddress,
-                onPlayerNameChanged = connectionViewModel::updatePlayerName,
-                onConnect = { withLocalNetworkPermission(connectionViewModel::connect) },
-                onDiscover = { withLocalNetworkPermission(connectionViewModel::discover) },
-                onSelectDiscoveredServer = connectionViewModel::selectDiscoveredServer,
-                onDisconnect = connectionViewModel::disconnect,
-                onForgetServer = connectionViewModel::forgetServer,
-            )
+            SandpiperTheme {
+                SendspinSatelliteApp(
+                    state = state,
+                    onServerAddressChanged = connectionViewModel::updateServerAddress,
+                    onPlayerNameChanged = connectionViewModel::updatePlayerName,
+                    onConnect = { withLocalNetworkPermission(connectionViewModel::connect) },
+                    onDiscover = { withLocalNetworkPermission(connectionViewModel::discover) },
+                    onSelectDiscoveredServer = connectionViewModel::selectDiscoveredServer,
+                    onDisconnect = connectionViewModel::disconnect,
+                    onForgetServer = connectionViewModel::forgetServer,
+                    onPlaybackCommand = connectionViewModel::sendPlaybackCommand,
+                    onConfirmPairingWindow = connectionViewModel::confirmPairingWindow,
+                    onCancelPairingWindow = connectionViewModel::cancelPairingWindow,
+                )
+            }
         }
     }
 

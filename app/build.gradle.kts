@@ -23,8 +23,8 @@ android {
         applicationId = "com.nanopixel.sendspinsatellite"
         minSdk = 24
         targetSdk = 37
-        versionCode = 1
-        versionName = "0.1.0-alpha.1"
+        versionCode = 3
+        versionName = "0.1.0-alpha.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -78,6 +78,7 @@ kotlin {
 dependencies {
     implementation(libs.androidx.appcompat)
     implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.core.splashscreen)
     implementation(libs.material)
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.lifecycle.runtime.ktx)

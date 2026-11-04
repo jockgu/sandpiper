@@ -3,6 +3,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -10,6 +12,7 @@
 
 #include <sendspin/client.h>
 #include <sendspin/artwork_role.h>
+#include <sendspin/controller_role.h>
 #include <sendspin/metadata_role.h>
 #include <sendspin/player_role.h>
 
@@ -19,17 +22,19 @@
 #include "playback_recovery_state.h"
 #include "reconnect_policy.h"
 #include "sendspin_pcm_listener.h"
+#include "jni_persistence_provider.h"
 
 namespace sendspin {
 
 class NativePlaybackEngine final : public SendspinClientListener,
                                    public SendspinNetworkProvider,
+                                   public ControllerRoleListener,
                                    public MetadataRoleListener,
                                    public ArtworkRoleListener {
 public:
     using State = PlaybackRecoveryState::State;
     NativePlaybackEngine(
-        std::string client_id,
+        std::unique_ptr<JniPersistenceProvider> persistence_provider,
         std::string player_name,
         uint8_t initial_volume,
         bool initial_muted);
@@ -79,10 +84,32 @@ public:
         int32_t output_xrun_count{-1};
         uint8_t player_volume{100};
         bool player_muted{false};
+        bool secure_storage_error{false};
+    };
+
+    struct ControllerCapabilities {
+        uint64_t revision{0};
+        bool play{false};
+        bool pause{false};
+        bool stop{false};
+    };
+
+    struct PairingUiSnapshot {
+        uint64_t revision{0};
+        std::string code;
+        bool pairing_active{false};
+        bool pairing_window_open{false};
+        bool last_pairing_failed{false};
+        int32_t last_pairing_failure_reason{-1};
+        bool server_trust_known{false};
+        bool server_paired{false};
     };
 
     bool connect(std::string url);
     void disconnect();
+    bool request_controller_command(SendspinControllerCommand command);
+    void confirm_pairing_window();
+    void cancel_pairing_window();
     void request_recovery(
         PlaybackRecoveryState::RecoveryCause cause =
             PlaybackRecoveryState::RecoveryCause::OutputError);
@@ -95,9 +122,23 @@ public:
         uint64_t known_revision) const;
     [[nodiscard]] std::optional<ArtworkState::Snapshot> artwork_after(
         uint64_t known_revision) const;
+    [[nodiscard]] std::optional<ControllerCapabilities> controller_capabilities_after(
+        uint64_t known_revision) const;
+    [[nodiscard]] std::optional<PairingUiSnapshot> pairing_ui_after(
+        uint64_t known_revision) const;
     bool is_network_ready() override;
     void on_time_sync_updated(float) override;
     void on_group_update(const GroupUpdateObject&) override;
+    void on_pairing_started(const std::string& server_id) override;
+    void on_pairing_succeeded(const std::string& server_id) override;
+    void on_pairing_failed(const std::string& server_id, SendspinPairAbortReason reason) override;
+    void on_trust_changed(ConnectionTrust trust) override;
+    void on_display_pairing_code(const std::string& code, SendspinPairingCodeFormat format) override;
+    void on_clear_pairing_code() override;
+    void on_open_pairing_window() override;
+    void on_close_pairing_window() override;
+    void on_controller_state(const ServerStateControllerObject& state) override;
+    void on_controller_state_clear() override;
     void on_metadata(const ServerMetadataStateObject& metadata) override;
     void on_metadata_clear() override;
     void on_image_decode(uint8_t slot, const uint8_t* data, size_t length,
@@ -118,13 +159,16 @@ private:
     void record_reconnect_completion();
     void drain_playback_feedback();
     void run();
+    [[nodiscard]] bool controller_command_supported_locked(SendspinControllerCommand command) const;
 
     OboePcmOutput output_;
     SendspinPcmListener listener_;
+    std::unique_ptr<JniPersistenceProvider> persistence_provider_;
     SendspinClient client_;
     PlayerRole& player_;
     MetadataRole& metadata_;
     ArtworkRole& artwork_;
+    ControllerRole& controller_;
     NowPlayingState now_playing_;
     ArtworkState artwork_state_;
     PlaybackRecoveryState recovery_state_;
@@ -134,10 +178,15 @@ private:
     std::atomic<bool> network_available_{true};
     mutable std::mutex diagnostics_mutex_;
     Diagnostics diagnostics_;
+    mutable std::mutex controller_capabilities_mutex_;
+    ControllerCapabilities controller_capabilities_;
+    mutable std::mutex pairing_ui_mutex_;
+    PairingUiSnapshot pairing_ui_;
     bool reconnect_attempt_active_{false};
     std::mutex control_mutex_;
     std::string pending_url_;
     bool disconnect_requested_{false};
+    std::deque<SendspinControllerCommand> pending_controller_commands_;
     std::atomic<bool> focus_suspended_{false};
     std::atomic<bool> buffering_requested_{false};
     std::atomic<bool> playing_requested_{false};

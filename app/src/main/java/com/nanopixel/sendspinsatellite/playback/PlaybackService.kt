@@ -1,5 +1,6 @@
 package com.nanopixel.sendspinsatellite.playback
 
+import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -21,7 +22,6 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
-import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.nanopixel.sendspinsatellite.MainActivity
@@ -45,6 +45,9 @@ class PlaybackService : Service() {
     private val connectivityManager by lazy { getSystemService(ConnectivityManager::class.java) }
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
     private val focusPolicy = AudioFocusPolicy()
+    private lateinit var playbackMediaSession: PlaybackMediaSession
+    private var mediaSessionReleased = false
+    private var lastNotificationIdentity: NotificationIdentity? = null
     private var focusRequest: AudioFocusRequest? = null
     private var deviceCallbackRegistered = false
     private var networkCallbackRegistered = false
@@ -125,6 +128,12 @@ class PlaybackService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        playbackMediaSession = PlaybackMediaSession(
+            context = this,
+            mainHandler = mainHandler,
+            onCommand = ::dispatchMediaCommand,
+            onArtworkUpdated = { refreshNotification(force = true) },
+        )
         createNotificationChannel()
     }
 
@@ -141,6 +150,11 @@ class PlaybackService : Service() {
             ACTION_DISCOVER -> discoverServers(intent.getStringExtra(EXTRA_PLAYER_NAME).orEmpty())
             ACTION_SELECT_DISCOVERED -> selectDiscoveredServer(intent.getStringExtra(EXTRA_SERVER_ID).orEmpty())
             ACTION_STOP -> stopPlayback()
+            ACTION_CONFIRM_PAIRING_WINDOW -> session?.confirmPairingWindow()
+            ACTION_CANCEL_PAIRING_WINDOW -> session?.cancelPairingWindow()
+            ACTION_PLAYBACK_COMMAND -> PlaybackCommand.entries
+                .firstOrNull { it.name == intent.getStringExtra(EXTRA_PLAYBACK_COMMAND) }
+                ?.let(::dispatchMediaCommand)
         }
         return START_NOT_STICKY
     }
@@ -336,16 +350,21 @@ class PlaybackService : Service() {
         shutdownSession()
         abandonAudioFocus()
         if (hadActiveResources) publish(PlaybackStatus())
+        mediaSessionReleased = true
+        playbackMediaSession.release()
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun startPlaybackForeground() {
+        val presentation = status.value.toMediaSessionPresentation()
+        playbackMediaSession.update(presentation, status.value.artwork)
+        lastNotificationIdentity = presentation.notificationIdentity
         ServiceCompat.startForeground(
             this,
             NOTIFICATION_ID,
-            notification(),
+            notification(presentation),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
         )
     }
@@ -512,6 +531,16 @@ class PlaybackService : Service() {
                     }
                     publish(status.value.copy(
                         connectionState = connectionState,
+                        supportedPlaybackCommands = if (connectionState in setOf(
+                                ConnectionState.READY,
+                                ConnectionState.BUFFERING,
+                                ConnectionState.PLAYING,
+                            )
+                        ) {
+                            status.value.supportedPlaybackCommands
+                        } else {
+                            emptySet()
+                        },
                         detail = if (!validatedNetworkAvailable && state != SendspinSession.SessionState.DISCONNECTED) {
                             "Waiting for a validated network."
                         } else {
@@ -551,12 +580,37 @@ class PlaybackService : Service() {
 
                 override fun onNowPlaying(snapshot: NowPlayingSnapshot) {
                     if (generation != sessionGeneration) return
-                    publish(status.value.copy(nowPlaying = snapshot), refreshNotification = false)
+                    publish(status.value.copy(nowPlaying = snapshot))
                 }
 
                 override fun onArtwork(snapshot: ArtworkSnapshot) {
                     if (generation != sessionGeneration) return
                     publish(status.value.copy(artwork = snapshot))
+                }
+
+                override fun onControllerCommands(commands: Set<PlaybackCommand>) {
+                    if (generation != sessionGeneration) return
+                    publish(status.value.copy(supportedPlaybackCommands = commands))
+                }
+
+                override fun onPairingUi(snapshot: NativePlaybackEngine.PairingUiSnapshot) {
+                    if (generation != sessionGeneration) return
+                    publish(status.value.copy(
+                        pairingCode = snapshot.code,
+                        pairingRevision = snapshot.revision,
+                        pairingActive = snapshot.pairingActive,
+                        pairingWindowOpen = snapshot.pairingWindowOpen,
+                        pairingFailed = snapshot.lastPairingFailed,
+                        pairingFailureReason = snapshot.pairingFailureReason.takeIf {
+                            snapshot.lastPairingFailed
+                        },
+                        serverPaired = snapshot.serverPaired.takeIf { snapshot.serverTrustKnown },
+                        detail = if (snapshot.lastPairingFailed) {
+                            "Pairing did not complete. Try pairing again from Music Assistant."
+                        } else {
+                            status.value.detail
+                        },
+                    ))
                 }
             },
         ).also { session = it }
@@ -629,36 +683,124 @@ class PlaybackService : Service() {
         session = null
     }
 
-    private fun publish(nextStatus: PlaybackStatus, refreshNotification: Boolean = true) {
+    private fun dispatchMediaCommand(command: PlaybackCommand) {
+        if (!status.value.canDispatchMediaCommand(command)) return
+        session?.requestControllerCommand(command)
+    }
+
+    private fun publish(nextStatus: PlaybackStatus) {
         status.value = nextStatus
-        if (refreshNotification && isForegroundService) {
-            getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification())
+        val update: () -> Unit = update@{
+            if (mediaSessionReleased || status.value != nextStatus) return@update
+            val presentation = nextStatus.toMediaSessionPresentation()
+            playbackMediaSession.update(presentation, nextStatus.artwork)
+            refreshNotification(presentation)
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            update()
+        } else {
+            mainHandler.post(update)
         }
     }
 
-    private fun notification() = NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
-        .setSmallIcon(R.drawable.ic_stat_sendspin)
-        .setContentTitle(getString(R.string.app_name))
-        .setContentText(status.value.connectionState.label)
-        .setContentIntent(PendingIntent.getActivity(
-            this,
+    private fun refreshNotification(
+        presentation: MediaSessionPresentation = status.value.toMediaSessionPresentation(),
+        force: Boolean = false,
+    ) {
+        if (!isForegroundService) return
+        if (!force && lastNotificationIdentity == presentation.notificationIdentity) return
+        getSystemService(NotificationManager::class.java).notify(
+            NOTIFICATION_ID,
+            notification(presentation),
+        )
+        lastNotificationIdentity = presentation.notificationIdentity
+    }
+
+    private fun notification(presentation: MediaSessionPresentation): Notification {
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
+        } else {
+            Notification.Builder(this)
+        }
+        val compactActionIndexes = mutableListOf<Int>()
+        builder
+            .setSmallIcon(R.drawable.ic_stat_sendspin)
+            .setContentTitle(presentation.title ?: getString(R.string.app_name))
+            .setContentText(presentation.artist ?: presentation.connectionState.label)
+            .setContentIntent(PendingIntent.getActivity(
+                this,
+                0,
+                Intent(this, MainActivity::class.java),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            ))
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+
+        val primaryCommand = when (presentation.state) {
+            MediaSessionState.PLAYING -> PlaybackCommand.PAUSE
+            MediaSessionState.PAUSED -> PlaybackCommand.PLAY
+            else -> null
+        }?.takeIf { it in presentation.actions }
+        primaryCommand?.let { command ->
+            compactActionIndexes += 0
+            builder.addAction(
+                command.notificationIcon(),
+                command.notificationLabel(),
+                playbackCommandPendingIntent(command),
+            )
+        }
+        if (PlaybackCommand.STOP in presentation.actions) {
+            builder.addAction(
+                PlaybackCommand.STOP.notificationIcon(),
+                PlaybackCommand.STOP.notificationLabel(),
+                playbackCommandPendingIntent(PlaybackCommand.STOP),
+            )
+        }
+        builder.addAction(
             0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        ))
-        .addAction(
-            0,
-            "Stop",
+            "Disconnect",
             PendingIntent.getService(
                 this,
-                1,
+                REQUEST_DISCONNECT,
                 Intent(this, PlaybackService::class.java).setAction(ACTION_STOP),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             ),
         )
-        .setOngoing(true)
-        .setOnlyAlertOnce(true)
-        .build()
+        builder.setStyle(
+            Notification.MediaStyle()
+                .setMediaSession(playbackMediaSession.token)
+                .setShowActionsInCompactView(*compactActionIndexes.toIntArray()),
+        )
+        return builder.build()
+    }
+
+    private fun playbackCommandPendingIntent(command: PlaybackCommand): PendingIntent =
+        PendingIntent.getService(
+            this,
+            command.requestCode(),
+            Intent(this, PlaybackService::class.java)
+                .setAction(ACTION_PLAYBACK_COMMAND)
+                .putExtra(EXTRA_PLAYBACK_COMMAND, command.name),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+
+    private fun PlaybackCommand.notificationIcon(): Int = when (this) {
+        PlaybackCommand.PLAY -> android.R.drawable.ic_media_play
+        PlaybackCommand.PAUSE -> android.R.drawable.ic_media_pause
+        PlaybackCommand.STOP -> android.R.drawable.ic_media_pause
+    }
+
+    private fun PlaybackCommand.notificationLabel(): String = when (this) {
+        PlaybackCommand.PLAY -> "Play"
+        PlaybackCommand.PAUSE -> "Pause"
+        PlaybackCommand.STOP -> "Stop group"
+    }
+
+    private fun PlaybackCommand.requestCode(): Int = when (this) {
+        PlaybackCommand.PLAY -> REQUEST_PLAY
+        PlaybackCommand.PAUSE -> REQUEST_PAUSE
+        PlaybackCommand.STOP -> REQUEST_GROUP_STOP
+    }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
@@ -679,12 +821,20 @@ class PlaybackService : Service() {
         const val ACTION_DISCOVER = "com.nanopixel.sendspinsatellite.action.DISCOVER"
         const val ACTION_SELECT_DISCOVERED = "com.nanopixel.sendspinsatellite.action.SELECT_DISCOVERED"
         const val ACTION_STOP = "com.nanopixel.sendspinsatellite.action.STOP"
+        const val ACTION_CONFIRM_PAIRING_WINDOW = "com.nanopixel.sendspinsatellite.action.CONFIRM_PAIRING_WINDOW"
+        const val ACTION_CANCEL_PAIRING_WINDOW = "com.nanopixel.sendspinsatellite.action.CANCEL_PAIRING_WINDOW"
+        const val ACTION_PLAYBACK_COMMAND = "com.nanopixel.sendspinsatellite.action.PLAYBACK_COMMAND"
         const val EXTRA_SERVER_ADDRESS = "server_address"
         const val EXTRA_PLAYER_NAME = "player_name"
         const val EXTRA_SERVER_NAME = "server_name"
         const val EXTRA_SERVER_ID = "server_id"
+        const val EXTRA_PLAYBACK_COMMAND = "playback_command"
         const val NOTIFICATION_CHANNEL_ID = "playback"
         const val NOTIFICATION_ID = 1
+        private const val REQUEST_PLAY = 10
+        private const val REQUEST_PAUSE = 11
+        private const val REQUEST_GROUP_STOP = 12
+        private const val REQUEST_DISCONNECT = 13
         private const val TAG = "PlaybackService"
         private const val DIAGNOSTICS_LOG_INTERVAL_MS = 30_000L
         private const val DISCOVERY_SELECTION_TIMEOUT_MS = 30_000L
@@ -750,6 +900,26 @@ class PlaybackService : Service() {
 
         internal fun stop(context: Context) {
             context.startService(Intent(context, PlaybackService::class.java).setAction(ACTION_STOP))
+        }
+
+        internal fun sendPlaybackCommand(context: Context, command: PlaybackCommand) {
+            context.startService(
+                Intent(context, PlaybackService::class.java)
+                    .setAction(ACTION_PLAYBACK_COMMAND)
+                    .putExtra(EXTRA_PLAYBACK_COMMAND, command.name),
+            )
+        }
+
+        internal fun confirmPairingWindow(context: Context) {
+            context.startService(
+                Intent(context, PlaybackService::class.java).setAction(ACTION_CONFIRM_PAIRING_WINDOW),
+            )
+        }
+
+        internal fun cancelPairingWindow(context: Context) {
+            context.startService(
+                Intent(context, PlaybackService::class.java).setAction(ACTION_CANCEL_PAIRING_WINDOW),
+            )
         }
 
         internal val state: StateFlow<PlaybackStatus> = status.asStateFlow()

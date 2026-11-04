@@ -4,22 +4,26 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <utility>
 
 namespace sendspin {
 namespace {
-SendspinClientConfig client_config(const std::string& client_id, const std::string& player_name) {
+SendspinClientConfig client_config(const std::string& player_name) {
     SendspinClientConfig config;
-    config.client_id = client_id;
     config.name = player_name;
-    config.product_name = "Sendspin Satellite";
+    config.product_name = "Sandpiper";
     config.manufacturer = "Nanopixel";
-    config.software_version = "0.1-alpha";
+    config.software_version = "0.1.0-alpha.3";
+    config.pairing_code_out_channels = {SendspinPairingCodeChannel::DISPLAY};
+    config.pairing_code_formats = {SendspinPairingCodeFormat::DIGITS};
     return config;
 }
 PlayerRoleConfig player_config() {
     PlayerRoleConfig config;
-    config.audio_formats = {{SendspinCodecFormat::PCM, PcmRenderFifo::kChannels,
-                             PcmRenderFifo::kSampleRate, 16}};
+    config.audio_formats = {
+        {SendspinCodecFormat::FLAC, PcmRenderFifo::kChannels, PcmRenderFifo::kSampleRate, 16},
+        {SendspinCodecFormat::PCM, PcmRenderFifo::kChannels, PcmRenderFifo::kSampleRate, 16},
+    };
     // Internet radio is inherently bursty. Keep one second queued at the server so brief
     // delivery gaps cannot drain the local PCM timeline; retain a modest scheduling lead.
     config.required_lead_time_ms = 250;
@@ -47,21 +51,28 @@ bool has_cause(
     const PlaybackRecoveryState::RecoveryCause cause) {
     return (mask & static_cast<PlaybackRecoveryState::RecoveryCauseMask>(cause)) != 0;
 }
-constexpr int64_t kProgressSampleIntervalUs = 1'000'000;
+constexpr int64_t kProgressSampleIntervalUs = 250'000;
+constexpr size_t kMaxPendingControllerCommands = 8;
 }  // namespace
 
 NativePlaybackEngine::NativePlaybackEngine(
-    std::string client_id,
+    std::unique_ptr<JniPersistenceProvider> persistence_provider,
     std::string player_name,
     const uint8_t initial_volume,
     const bool initial_muted)
     : listener_(output_, &NativePlaybackEngine::on_stream_started, this),
-      client_(client_config(client_id, player_name)),
+      persistence_provider_(std::move(persistence_provider)),
+      client_(client_config(player_name)),
       player_(client_.add_player(player_config())),
       metadata_(client_.add_metadata()),
-      artwork_(client_.add_artwork(artwork_config())) {
+      artwork_(client_.add_artwork(artwork_config())),
+      controller_(client_.add_controller()) {
     client_.set_listener(this);
     client_.set_network_provider(this);
+    if (persistence_provider_ != nullptr) {
+        client_.set_persistence_provider(persistence_provider_.get());
+    }
+    client_.set_unpaired_access_enabled(false);
     player_.set_listener(&listener_);
     player_.update_volume(initial_volume > 100 ? 100 : initial_volume);
     player_.update_muted(initial_muted);
@@ -70,6 +81,7 @@ NativePlaybackEngine::NativePlaybackEngine(
     diagnostics_.player_muted = player_.get_muted();
     metadata_.set_listener(this);
     artwork_.set_listener(this);
+    controller_.set_listener(this);
     output_.set_playback_observer(&NativePlaybackEngine::on_frames_played, this);
 }
 NativePlaybackEngine::~NativePlaybackEngine() {
@@ -79,6 +91,14 @@ NativePlaybackEngine::~NativePlaybackEngine() {
     output_.stop();
 }
 bool NativePlaybackEngine::connect(std::string url) {
+    if (persistence_provider_ != nullptr && persistence_provider_->failed()) {
+        {
+            std::lock_guard lock(diagnostics_mutex_);
+            diagnostics_.secure_storage_error = true;
+        }
+        state_.store(State::Error, std::memory_order_release);
+        return false;
+    }
     if (url.empty() || !output_.start()) {
         now_playing_.clear_all_current_generation();
         artwork_state_.clear_all_current_generation();
@@ -91,9 +111,11 @@ bool NativePlaybackEngine::connect(std::string url) {
         std::lock_guard lock(control_mutex_);
         pending_url_ = std::move(url);
         disconnect_requested_ = false;
+        pending_controller_commands_.clear();
     }
     state_.store(State::Connecting, std::memory_order_release);
     if (!running_.exchange(true, std::memory_order_acq_rel)) {
+        if (loop_thread_.joinable()) loop_thread_.join();
         loop_thread_ = std::thread(&NativePlaybackEngine::run, this);
     }
     return true;
@@ -101,10 +123,56 @@ bool NativePlaybackEngine::connect(std::string url) {
 void NativePlaybackEngine::disconnect() {
     now_playing_.clear_all_current_generation();
     artwork_state_.clear_all_current_generation();
+    {
+        std::lock_guard lock(pairing_ui_mutex_);
+        ++pairing_ui_.revision;
+        pairing_ui_.code.clear();
+        pairing_ui_.pairing_active = false;
+        pairing_ui_.pairing_window_open = false;
+        pairing_ui_.last_pairing_failed = false;
+        pairing_ui_.last_pairing_failure_reason = -1;
+        pairing_ui_.server_trust_known = false;
+        pairing_ui_.server_paired = false;
+    }
     std::lock_guard lock(control_mutex_);
     pending_url_.clear();
     disconnect_requested_ = true;
+    pending_controller_commands_.clear();
     state_.store(State::Stopped, std::memory_order_release);
+}
+bool NativePlaybackEngine::request_controller_command(
+    const SendspinControllerCommand command) {
+    const auto current_state = state_.load(std::memory_order_acquire);
+    if (current_state != State::Ready && current_state != State::Buffering &&
+        current_state != State::Playing) {
+        return false;
+    }
+    {
+        std::lock_guard lock(controller_capabilities_mutex_);
+        if (!controller_command_supported_locked(command)) return false;
+    }
+    std::lock_guard lock(control_mutex_);
+    if (disconnect_requested_) return false;
+    // ponytail: cap the UI command backlog at eight; add a dedicated queue only if command
+    // throughput grows beyond interactive button use.
+    if (pending_controller_commands_.size() >= kMaxPendingControllerCommands) return false;
+    pending_controller_commands_.push_back(command);
+    return true;
+}
+void NativePlaybackEngine::confirm_pairing_window() { client_.confirm_pairing_window(); }
+void NativePlaybackEngine::cancel_pairing_window() { client_.cancel_pairing_window(); }
+bool NativePlaybackEngine::controller_command_supported_locked(
+    const SendspinControllerCommand command) const {
+    switch (command) {
+        case SendspinControllerCommand::PLAY:
+            return controller_capabilities_.play;
+        case SendspinControllerCommand::PAUSE:
+            return controller_capabilities_.pause;
+        case SendspinControllerCommand::STOP:
+            return controller_capabilities_.stop;
+        default:
+            return false;
+    }
 }
 void NativePlaybackEngine::request_recovery(const PlaybackRecoveryState::RecoveryCause cause) {
     recovery_state_.request_recovery(cause);
@@ -130,6 +198,18 @@ std::optional<NowPlayingState::Snapshot> NativePlaybackEngine::now_playing_after
 std::optional<ArtworkState::Snapshot> NativePlaybackEngine::artwork_after(
     const uint64_t known_revision) const {
     return artwork_state_.snapshot_after(known_revision);
+}
+std::optional<NativePlaybackEngine::ControllerCapabilities>
+NativePlaybackEngine::controller_capabilities_after(const uint64_t known_revision) const {
+    std::lock_guard lock(controller_capabilities_mutex_);
+    if (controller_capabilities_.revision == known_revision) return std::nullopt;
+    return controller_capabilities_;
+}
+std::optional<NativePlaybackEngine::PairingUiSnapshot>
+NativePlaybackEngine::pairing_ui_after(const uint64_t known_revision) const {
+    std::lock_guard lock(pairing_ui_mutex_);
+    if (pairing_ui_.revision == known_revision) return std::nullopt;
+    return pairing_ui_;
 }
 bool NativePlaybackEngine::is_network_ready() {
     return network_available_.load(std::memory_order_acquire);
@@ -164,6 +244,81 @@ void NativePlaybackEngine::on_group_update(const GroupUpdateObject&) {
             : NowPlayingState::GroupPlaybackState::Stopped;
     }
     now_playing_.update_group(recovery_state_.recovery_generation(), std::move(snapshot));
+}
+void NativePlaybackEngine::on_pairing_started(const std::string&) {
+    std::lock_guard lock(pairing_ui_mutex_);
+    ++pairing_ui_.revision;
+    pairing_ui_.code.clear();
+    pairing_ui_.pairing_active = true;
+    pairing_ui_.pairing_window_open = false;
+    pairing_ui_.last_pairing_failed = false;
+    pairing_ui_.last_pairing_failure_reason = -1;
+}
+void NativePlaybackEngine::on_pairing_succeeded(const std::string&) {
+    std::lock_guard lock(pairing_ui_mutex_);
+    ++pairing_ui_.revision;
+    pairing_ui_.code.clear();
+    pairing_ui_.pairing_active = false;
+    pairing_ui_.pairing_window_open = false;
+    pairing_ui_.last_pairing_failed = false;
+    pairing_ui_.last_pairing_failure_reason = -1;
+}
+void NativePlaybackEngine::on_pairing_failed(
+    const std::string&, const SendspinPairAbortReason reason) {
+    std::lock_guard lock(pairing_ui_mutex_);
+    ++pairing_ui_.revision;
+    pairing_ui_.code.clear();
+    pairing_ui_.pairing_active = false;
+    pairing_ui_.pairing_window_open = false;
+    pairing_ui_.last_pairing_failed = true;
+    pairing_ui_.last_pairing_failure_reason = static_cast<int32_t>(reason);
+}
+void NativePlaybackEngine::on_trust_changed(const ConnectionTrust trust) {
+    std::lock_guard lock(pairing_ui_mutex_);
+    ++pairing_ui_.revision;
+    pairing_ui_.server_trust_known = true;
+    pairing_ui_.server_paired = trust == ConnectionTrust::USER;
+}
+void NativePlaybackEngine::on_display_pairing_code(
+    const std::string& code, const SendspinPairingCodeFormat format) {
+    std::lock_guard lock(pairing_ui_mutex_);
+    ++pairing_ui_.revision;
+    pairing_ui_.code = format == SendspinPairingCodeFormat::DIGITS ? code : std::string{};
+}
+void NativePlaybackEngine::on_clear_pairing_code() {
+    std::lock_guard lock(pairing_ui_mutex_);
+    ++pairing_ui_.revision;
+    pairing_ui_.code.clear();
+    if (!pairing_ui_.pairing_window_open) pairing_ui_.pairing_active = false;
+}
+void NativePlaybackEngine::on_open_pairing_window() {
+    std::lock_guard lock(pairing_ui_mutex_);
+    ++pairing_ui_.revision;
+    pairing_ui_.pairing_window_open = true;
+}
+void NativePlaybackEngine::on_close_pairing_window() {
+    std::lock_guard lock(pairing_ui_mutex_);
+    ++pairing_ui_.revision;
+    pairing_ui_.pairing_window_open = false;
+    if (pairing_ui_.code.empty()) pairing_ui_.pairing_active = false;
+}
+void NativePlaybackEngine::on_controller_state(const ServerStateControllerObject& state) {
+    const auto supports = [&state](const SendspinControllerCommand command) {
+        return std::find(state.supported_commands.begin(), state.supported_commands.end(), command) !=
+            state.supported_commands.end();
+    };
+    std::lock_guard lock(controller_capabilities_mutex_);
+    ++controller_capabilities_.revision;
+    controller_capabilities_.play = supports(SendspinControllerCommand::PLAY);
+    controller_capabilities_.pause = supports(SendspinControllerCommand::PAUSE);
+    controller_capabilities_.stop = supports(SendspinControllerCommand::STOP);
+}
+void NativePlaybackEngine::on_controller_state_clear() {
+    std::lock_guard lock(controller_capabilities_mutex_);
+    ++controller_capabilities_.revision;
+    controller_capabilities_.play = false;
+    controller_capabilities_.pause = false;
+    controller_capabilities_.stop = false;
 }
 void NativePlaybackEngine::on_metadata(const ServerMetadataStateObject& metadata) {
     NowPlayingState::Metadata snapshot;
@@ -282,7 +437,15 @@ void NativePlaybackEngine::drain_playback_feedback() {
     }
 }
 void NativePlaybackEngine::run() {
-    if (!client_.start()) {
+    const bool started = client_.start();
+    const bool storage_error = persistence_provider_ != nullptr && persistence_provider_->failed();
+    if (!started || storage_error) {
+        if (started) client_.stop();
+        output_.stop();
+        {
+            std::lock_guard lock(diagnostics_mutex_);
+            diagnostics_.secure_storage_error = storage_error;
+        }
         recovery_state_.fail();
         publish_state();
         running_.store(false, std::memory_order_release);
@@ -293,6 +456,7 @@ void NativePlaybackEngine::run() {
     bool had_connection = false;
     bool was_network_available = network_available_.load(std::memory_order_acquire);
     int64_t next_progress_sample_us = 0;
+    bool storage_failure_reported = false;
     while (running_.load(std::memory_order_acquire)) {
         const auto now_us = monotonic_us();
         if (output_.take_error_recovery_request()) {
@@ -300,13 +464,16 @@ void NativePlaybackEngine::run() {
         }
         std::string url;
         bool disconnect = false;
+        std::deque<SendspinControllerCommand> controller_commands;
         {
             std::lock_guard lock(control_mutex_);
             url.swap(pending_url_);
             disconnect = disconnect_requested_;
             disconnect_requested_ = false;
+            controller_commands.swap(pending_controller_commands_);
         }
         if (disconnect) {
+            controller_commands.clear();
             focus_suspended = false;
             reconnect_policy_.cancel();
             active_url.clear();
@@ -402,6 +569,7 @@ void NativePlaybackEngine::run() {
             }
         }
         if (!disconnect && !focus_suspended && network_available && !active_url.empty() &&
+            (persistence_provider_ == nullptr || !persistence_provider_->failed()) &&
             reconnect_policy_.take_due_attempt(now_us)) {
             const bool retrying =
                 recovery_state_.state() == PlaybackRecoveryState::State::Recovering;
@@ -430,6 +598,27 @@ void NativePlaybackEngine::run() {
             }
         }
         client_.loop();
+        if (!storage_failure_reported && persistence_provider_ != nullptr &&
+            persistence_provider_->failed()) {
+            storage_failure_reported = true;
+            client_.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+            active_url.clear();
+            output_.clear();
+            {
+                std::lock_guard lock(diagnostics_mutex_);
+                diagnostics_.secure_storage_error = true;
+            }
+            recovery_state_.fail();
+            publish_state();
+        }
+        if (!disconnect && client_.is_connected()) {
+            const auto& supported = controller_.get_controller_state().supported_commands;
+            for (const auto command : controller_commands) {
+                if (std::find(supported.begin(), supported.end(), command) != supported.end()) {
+                    controller_.send_command({.command = command});
+                }
+            }
+        }
         drain_playback_feedback();
         if (buffering_requested_.exchange(false, std::memory_order_acq_rel)) {
             recovery_state_.buffering();
@@ -452,6 +641,10 @@ void NativePlaybackEngine::run() {
         if (had_connection && !connected) {
             recovery_state_.request_recovery(
                 PlaybackRecoveryState::RecoveryCause::TransportLost);
+            std::lock_guard lock(pairing_ui_mutex_);
+            ++pairing_ui_.revision;
+            pairing_ui_.server_trust_known = false;
+            pairing_ui_.server_paired = false;
         }
         had_connection = connected;
         if (!focus_suspended && !connected && reconnect_policy_.attempt_timed_out(now_us)) {

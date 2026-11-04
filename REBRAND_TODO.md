@@ -91,7 +91,7 @@ Working description: **A Sendspin player for Android.**
 - [ ] Use consistent Sandpiper wording and artwork for APK download descriptions,
   screenshots, release notes, and any future store listing. Describe Sendspin
   compatibility factually and use our own artwork.
-- [ ] For the rebranded APK, increase `versionCode`, select the release version,
+- [x] For the rebranded APK, increase `versionCode`, select the release version,
   and use the same signing certificate as the build it replaces. Coordinate the
   advertised native software version with the Android release version.
 
@@ -100,7 +100,7 @@ Working description: **A Sendspin player for Android.**
 These are implementation and release checks; creating this plan does not mark
 them as passed.
 
-- [ ] Run the existing Android unit tests after name changes and build the APK.
+- [x] Run the existing Android unit tests after name changes and build the APK.
   Update affected assertions, including `PlayerNamePolicyTest` and diagnostics
   tests; retain `ApplicationIdentityTest` as a check of the existing package ID.
 - [ ] Upgrade a currently paired encrypted alpha installation without uninstalling.

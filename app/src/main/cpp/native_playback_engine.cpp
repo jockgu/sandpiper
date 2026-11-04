@@ -13,7 +13,7 @@ SendspinClientConfig client_config(const std::string& player_name) {
     config.name = player_name;
     config.product_name = "Sandpiper";
     config.manufacturer = "Nanopixel";
-    config.software_version = "0.1-alpha";
+    config.software_version = "0.1.0-alpha.3";
     config.pairing_code_out_channels = {SendspinPairingCodeChannel::DISPLAY};
     config.pairing_code_formats = {SendspinPairingCodeFormat::DIGITS};
     return config;
